@@ -1,11 +1,13 @@
-name: Feed v12 - 6 Markets Real Team Form
+name: Feed v13 FOREVER - Top First Minor Backup
 on:
+  schedule:
+    - cron: '0 5 * * *'
   workflow_dispatch:
 jobs:
   feed:
     runs-on: ubuntu-latest
     steps:
-      - name: Feed 6 Markets Real Form
+      - name: Feed FOREVER 6 Markets Real Form
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -17,10 +19,27 @@ jobs:
           KEY=os.environ['API_FOOTBALL_KEY']; SUPA_URL=os.environ['SUPABASE_URL']; SUPA_KEY=os.environ['SUPABASE_ANON_KEY']
           hdr={"x-apisports-key":KEY}
           today=(datetime.now(timezone.utc)+timedelta(hours=3)).strftime('%Y-%m-%d')
-          fx=requests.get(f"https://v3.football.api-sports.io/fixtures?date={today}",headers=hdr).json().get('response',[])
-          if len(fx)<5:
-            fx=requests.get("https://v3.football.api-sports.io/fixtures?next=20",headers=hdr).json().get('response',[])
-          print(f"Found {len(fx)} games for {today}")
+          print(f"=== FETCHING {today} ===")
+          all_today=requests.get(f"https://v3.football.api-sports.io/fixtures?date={today}",headers=hdr).json().get('response',[])
+          print(f"All today: {len(all_today)} games")
+
+          # TOP LEAGUES IDs
+          TOP_IDS=[39,140,135,78,61,94,88,203,2,3,15,45,277,404,271] 
+          top_games=[f for f in all_today if f['league']['id'] in TOP_IDS]
+          print(f"Top leagues today: {len(top_games)}")
+
+          # FOREVER LOGIC: Top first, minor backup, next days fallback
+          if len(top_games)>=8:
+            fx=top_games
+            source="TOP LEAGUES"
+          elif len(all_today)>=10:
+            fx=all_today
+            source=f"ALL TODAY (minor backup) - Top had {len(top_games)}"
+          else:
+            nxt=requests.get("https://v3.football.api-sports.io/fixtures?next=30",headers=hdr).json().get('response',[])
+            fx=nxt
+            source=f"NEXT 30 (forever) - Today had {len(all_today)}"
+          print(f"Using {source}: {len(fx)} games")
 
           def team_form(team_id):
             try:
@@ -30,7 +49,6 @@ jobs:
               gc=sum([(g['goals']['away'] if g['teams']['home']['id']==team_id else g['goals']['home']) or 0 for g in rr])/max(1,len(rr))
               return gs,gc
             except: return 1.2,1.1
-
           def poisson(k,l):
             f=1
             for i in range(2,k+1): f*=i
@@ -39,39 +57,31 @@ jobs:
           out=[]
           for f in fx[:15]:
             hid=f['teams']['home']['id']; aid=f['teams']['away']['id']
-            hs,hc=team_form(hid); aw_s,aw_c=team_form(aid)
-            xg_home=round((hs+aw_c)/2+0.25,2)
-            xg_away=round((aw_s+hc)/2,2)
+            hs,hc=team_form(hid); aws,awc=team_form(aid)
+            xg_home=round((hs+awc)/2+0.25,2)
+            xg_away=round((aws+hc)/2,2)
             xg_total=xg_home+xg_away
-            # Over markets
             p0=poisson(0,xg_total); p1=poisson(1,xg_total); p2=poisson(2,xg_total)
             over05_ht=round((1-poisson(0,xg_total*0.46))*100,1)
             over15=round((1-p0-p1)*100,1)
             over25=round((1-p0-p1-p2)*100,1)
-            # BTTS
             btts=round((1-poisson(0,xg_home))*(1-poisson(0,xg_away))*100,1)
-            # Home Win / 1X via matrix 0-5
             home_win=0; draw=0
             for h in range(6):
               for a in range(6):
                 p=poisson(h,xg_home)*poisson(a,xg_away)
                 if h>a: home_win+=p
                 elif h==a: draw+=p
-            home_win=round(home_win*100,1); draw=round(draw*100,1)
-            p1x=round(home_win+draw,1)
-            out.append({
-              "home":f['teams']['home']['name'],"away":f['teams']['away']['name'],
-              "league":f['league']['name'],"date":f['fixture']['date'][:10],"time":f['fixture']['date'][11:16],
-              "xg":xg_total,"xg_home":xg_home,"xg_away":xg_away,
-              "p_over15":over15,"p_over25":over25,"p_over05_ht":over05_ht,
-              "p_btts":btts,"p_homewin":home_win,"p_1x":p1x,
-              "edge":round(over15-71,1),"status":"v12_6markets_real_form"
-            })
+            home_win=round(home_win*100,1); p1x=round(home_win+draw*100,1)
+            if p1x>95: p1x=95
+            out.append({"home":f['teams']['home']['name'],"away":f['teams']['away']['name'],"league":f['league']['name'],"date":f['fixture']['date'][:10],"time":f['fixture']['date'][11:16],"xg":xg_total,"xg_home":xg_home,"xg_away":xg_away,"p_over15":over15,"p_over25":over25,"p_over05_ht":over05_ht,"p_btts":btts,"p_homewin":home_win,"p_1x":p1x,"edge":round(over15-71,1),"status":f"v13_forever_{source[:30]}"})
+
           h={"apikey":SUPA_KEY,"Authorization":f"Bearer {SUPA_KEY}","Content-Type":"application/json","Prefer":"return=minimal"}
+          requests.delete(f"{SUPA_URL}/rest/v1/fixtures?date=neq.2099-01-01",headers={"apikey":SUPA_KEY,"Authorization":f"Bearer {SUPA_KEY}"})
           saved=0
           for g in out:
             r=requests.post(f"{SUPA_URL}/rest/v1/fixtures",json=g,headers=h)
-            print(f"{g['home']} vs {g['away']} | xGH {g['xg_home']} xGA {g['xg_away']} | HomeWin {g['p_homewin']}% 1X {g['p_1x']}% BTTS {g['p_btts']}% -> {r.status_code}")
+            print(f"{g['league'][:15]}: {g['home']} vs {g['away']} | xGH {g['xg_home']} xGA {g['xg_away']} -> {r.status_code}")
             if r.status_code in [200,201]: saved+=1
-          print(f"SAVED {saved} games with 6 markets REAL FORM")
+          print(f"FINAL v13 FOREVER SAVED {saved} games from {source} - App will NEVER be empty!")
           PY
