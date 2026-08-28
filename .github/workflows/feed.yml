@@ -1,9 +1,8 @@
-name: FootyEdge Real Data Feeder v12
+name: Feed TODAY First - Real xG
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 3 * * *'
   workflow_dispatch:
-
 jobs:
   feed:
     runs-on: ubuntu-latest
@@ -15,45 +14,63 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
           python3 << 'PY'
-          import os, requests, math, datetime
-          from datetime import timedelta
-          API_KEY=os.environ['API_FOOTBALL_KEY']
+          import os, requests, math
+          from datetime import datetime, timezone, timedelta
+          KEY=os.environ['API_FOOTBALL_KEY']
           SUPA_URL=os.environ['SUPABASE_URL']
           SUPA_KEY=os.environ['SUPABASE_ANON_KEY']
-          tomorrow=(datetime.datetime.utcnow()+timedelta(days=1)).strftime('%Y-%m-%d')
-          headers={"x-apisports-key":API_KEY}
-          r=requests.get(f"https://v3.football.api-sports.io/fixtures?date={tomorrow}",headers=headers)
-          fixtures=r.json().get('response',[])[:25]
-          if not fixtures:
-            today=datetime.datetime.utcnow().strftime('%Y-%m-%d')
-            r=requests.get(f"https://v3.football.api-sports.io/fixtures?date={today}",headers=headers)
-            fixtures=r.json().get('response',[])[:25]
-          print(f"Found {len(fixtures)} games")
-          def poisson(k,l):
-            import math
-            fact=1
-            for i in range(2,k+1): fact*=i
-            return (l**k * math.exp(-l))/fact if fact else 0
-          out=[]
-          for f in fixtures:
+          hdr={"x-apisports-key":KEY}
+          
+          # TODAY in EAT (Kisumu) + UTC
+          now_utc=datetime.now(timezone.utc)
+          today_eat=(now_utc+timedelta(hours=3)).strftime('%Y-%m-%d')
+          today_utc=now_utc.strftime('%Y-%m-%d')
+          tomorrow_eat=(now_utc+timedelta(hours=3)+timedelta(days=1)).strftime('%Y-%m-%d')
+          
+          fx=[]
+          for d, label in [(today_eat, "TODAY EAT"), (today_utc, "TODAY UTC"), (tomorrow_eat, "TOMORROW EAT")]:
+            if fx: break
+            url=f"https://v3.football.api-sports.io/fixtures?date={d}"
+            res=requests.get(url,headers=hdr).json().get('response',[])
+            fx=res
+            print(f"Try {label} {d}: Found {len(res)} games")
+          
+          # Fallback if all dates empty
+          if len(fx)==0:
+            url="https://v3.football.api-sports.io/fixtures?next=20"
+            fx=requests.get(url,headers=hdr).json().get('response',[])
+            print(f"Fallback next=20: Found {len(fx)} games")
+          
+          def avg_scored(team_id):
             try:
-              home=f['teams']['home']['name']; away=f['teams']['away']['name']
-              league=f['league']['name']; date=f['fixture']['date'][:10]
-              time=f['fixture']['date'][11:16]
-              xg=2.1; p_over=0.84
-              # Simple real xG: base 2.1 + randomness from IDs (free plan no stats, but better than hash)
-              xg=round(1.7 + (f['teams']['home']['id']%10)*0.1,2)
-              p0=poisson(0,xg); p1=poisson(1,xg)
-              p_over=1-p0-p1
-              odd=round(1/(p_over*0.92),2) # fake book implied 92% of model
-              edge=round(p_over*100 - (1/odd*100),1)
-              out.append({"date":date,"home":home,"away":away,"league":league,"time":time,"xg":xg,"p_over15":round(p_over*100,1),"edge":edge,"status":"real_v12"})
-              print(f"{home} vs {away} xG {xg} Over {p_over*100:.1f}% Edge {edge}%")
-            except Exception as e:
-              print(e); continue
-          # Save to Supabase
+              rr=requests.get(f"https://v3.football.api-sports.io/fixtures?team={team_id}&last=5",headers=hdr).json().get('response',[])
+              if not rr: return 1.3,1.1
+              gs=sum([(g['goals']['home'] if g['teams']['home']['id']==team_id else g['goals']['away']) or 0 for g in rr])/max(1,len(rr))
+              gc=sum([(g['goals']['away'] if g['teams']['home']['id']==team_id else g['goals']['home']) or 0 for g in rr])/max(1,len(rr))
+              return gs,gc
+            except: return 1.3,1.1
+          
+          out=[]
+          for f in fx[:15]:
+            hid=f['teams']['home']['id']; aid=f['teams']['away']['id']
+            hs,hc=avg_scored(hid); aw_s,aw_c=avg_scored(aid)
+            xg=round((hs+aw_c)/2+0.3,2)
+            def poiss(k,l):
+              fact=1
+              for i in range(2,k+1): fact*=i
+              return (l**k*math.exp(-l))/fact
+            p0=poiss(0,xg); p1=poiss(1,xg); p2=poiss(2,xg)
+            over15=round((1-p0-p1)*100,1); over25=round((1-p0-p1-p2)*100,1)
+            out.append({
+              "home":f['teams']['home']['name'],"away":f['teams']['away']['name'],
+              "league":f['league']['name'],"date":f['fixture']['date'][:10],
+              "time":f['fixture']['date'][11:16],"xg":xg,
+              "p_over15":over15,"p_over25":over25,"edge":round(over15-72,1),"status":"today_first_v11"
+            })
           h={"apikey":SUPA_KEY,"Authorization":f"Bearer {SUPA_KEY}","Content-Type":"application/json","Prefer":"return=minimal"}
+          saved=0
           for g in out:
-            requests.post(f"{SUPA_URL}/rest/v1/fixtures",json=g,headers=h)
-          print(f"Saved {len(out)}")
+            r=requests.post(f"{SUPA_URL}/rest/v1/fixtures",json=g,headers=h)
+            if r.status_code in [200,201]: saved+=1
+          print(f"Final: Saved {saved} games for TODAY")
           PY
